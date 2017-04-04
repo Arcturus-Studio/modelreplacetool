@@ -68,5 +68,21 @@ namespace ModelReplaceTool
             }
             return conflictsChanged;
         }
+
+        //Fills out the given dictionary with a map of all components in the tree to the ModelTreeNode they are associated with
+        public void FillComponentToNodeMap(Dictionary<Component, ModelTreeNode> map)
+        {
+            if(comps != null)
+            {
+                foreach(Component c in comps)
+                {
+                    map[c] = this;
+                }
+            }
+            for(int i = 0; i < children.Count; i++)
+            {
+                children[i].FillComponentToNodeMap(map);
+            }
+        }
     }
 }

@@ -49,6 +49,9 @@ namespace ModelReplaceTool
         GameObject srcModel;
         ModelTreeNode treeRoot;
         Vector2 scrollPos;
+        Dictionary<UnityEngine.Object, UnityEngine.Object> refFixupMap;
+
+        delegate void ReferenceProcessor(Component comp, SerializedProperty prop, UnityEngine.Object propObjRef);
 
         bool TargetsValid
         {
@@ -81,11 +84,11 @@ namespace ModelReplaceTool
             }
 
             //Execute button
-            GUI.enabled = TargetsValid && treeRoot.remapTarget != null;
+            GUI.enabled = TargetsValid && treeValid;
             if (GUILayout.Button("Copy to Targets"))
             {
                 RemapAndInvokeRecursive(treeRoot);
-                FindCrossReferencesInTree(treeRoot.remapTarget, srcObj);
+                ProcessCrossReferencesInTree();
             }
             GUI.enabled = true;
             GUILayout.EndScrollView();
@@ -314,13 +317,14 @@ namespace ModelReplaceTool
         //(not *actually* recursive)
         void RemapAndInvokeRecursive(ModelTreeNode start)
         {
+            refFixupMap = new Dictionary<UnityEngine.Object, UnityEngine.Object>();
             List<MethodDef> methodsToInvoke = new List<MethodDef>();
             Stack<ModelTreeNode> nodes = new Stack<ModelTreeNode>();
             nodes.Push(start);
             while (nodes.Count > 0)
             {
                 ModelTreeNode node = nodes.Pop();
-                Remap(node, methodsToInvoke);
+                Remap(node, methodsToInvoke, refFixupMap);
                 foreach (ModelTreeNode c in node.children)
                 {
                     if (node.hasAdditions)
@@ -334,8 +338,13 @@ namespace ModelReplaceTool
 
         //Copies the given node and attaches it to its remap target.
         //MethodsToInvoke is populated with MethodDefs for any methods in copied components with the OnModelReplaced attribute.
-        void Remap(ModelTreeNode node, List<MethodDef> methodsToInvoke)
+        //All performed remaps (modified and cloned components, duplicated gameobjects, and targeted non-additions) are added to the remaps dictionary
+        void Remap(ModelTreeNode node, List<MethodDef> methodsToInvoke, Dictionary<UnityEngine.Object, UnityEngine.Object> remaps)
         {
+            if (node.obj != null && node.remapTarget != null)
+            {
+                remaps[node.obj] = node.remapTarget;
+            }
             if (!node.hasAdditions || !node.isAddition || node.remapTarget == null)
             {
                 return;
@@ -343,10 +352,13 @@ namespace ModelReplaceTool
             if (node.comps != null)
             {
                 //Copy components to target
-                List<Component> copiedComponents = CopyComponents(node.comps, node.remapTarget, node.conflictResolutions);
+                List<Component> copiedComponents = CopyComponents(node.comps, node.remapTarget, node.conflictResolutions, remaps);
 
                 //Get on-replace functions
-                methodsToInvoke.AddRange(GetOnReplaceMethodDefs(copiedComponents, node.obj));
+                foreach (Component copiedComp in copiedComponents)
+                {
+                    methodsToInvoke.AddRange(GetOnReplaceMethodDefs(copiedComp, node.obj));
+                }
             }
             else
             {
@@ -354,43 +366,51 @@ namespace ModelReplaceTool
                 GameObject dupe = Instantiate(node.obj);
                 dupe.name = node.obj.name;
                 dupe.transform.SetParent(node.remapTarget.transform, false);
-                //Collect OnModelReplaced funcs in dupe
+                //Collect remaps and OnModelReplaced funcs in dupe
                 Stack<Transform> dupes = new Stack<Transform>();
                 Stack<Transform> originals = new Stack<Transform>();
                 dupes.Push(dupe.transform);
                 originals.Push(node.obj.transform);
                 while (dupes.Count > 0)
                 {
-                    Transform dupeTrans = dupes.Pop();
-                    Transform origTrans = originals.Pop();
-                    methodsToInvoke.AddRange(GetOnReplaceMethodDefs(dupeTrans.GetComponents<Component>(), origTrans.gameObject));
-                    foreach (Transform t in dupeTrans)
+                    var dupeTrans = dupes.Pop();
+                    var origTrans = originals.Pop();
+                    remaps[origTrans.gameObject] = dupeTrans.gameObject;
+                    Component[] dupeComps = dupeTrans.GetComponents<Component>();
+                    Component[] origComps = origTrans.GetComponents<Component>();
+                    for(int i = 0; i < dupeComps.Length; i++)
                     {
-                        dupes.Push(t);
+                        methodsToInvoke.AddRange(GetOnReplaceMethodDefs(dupeComps[i], origTrans.gameObject));
+                        remaps[dupeComps[i]] = origComps[i];
+                        //Sanity check / error out if Unity scrambles the component order (which it shouldnt)
+                        if(dupeComps[i].GetType() != origComps[i].GetType())
+                        {
+                            throw new Exception("Component type mismatch");
+                        }
                     }
-                    foreach (Transform t in origTrans)
+                    foreach(Transform dupeChild in dupeTrans)
                     {
-                        originals.Push(t);
+                        dupes.Push(dupeChild);
+                    }
+                    foreach(Transform origChild in origTrans)
+                    {
+                        originals.Push(origChild);
                     }
                 }
             }
         }
 
-        //Returns methodDefs for methods with the OnModelReplaced attribute in the given list of components.
-        //The components are assumed to be on the same gameobject as each other.
+        //Returns methodDefs for methods with the OnModelReplaced attribute in the given component.
         //The oldObj field of the methodDef is filled with the passed oldObject param.
-        List<MethodDef> GetOnReplaceMethodDefs(IList<Component> comps, GameObject oldObject)
+        List<MethodDef> GetOnReplaceMethodDefs(Component comp, GameObject oldObject)
         {
             List<MethodDef> methodDefs = new List<MethodDef>();
-            foreach (var comp in comps)
+            foreach (MethodInfo method in comp.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
             {
-                foreach (MethodInfo method in comp.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                object[] attributes = method.GetCustomAttributes(typeof(OnModelReplacedAttribute), true);
+                if (attributes.Length > 0)
                 {
-                    object[] attributes = method.GetCustomAttributes(typeof(OnModelReplacedAttribute), true);
-                    if (attributes.Length > 0)
-                    {
-                        methodDefs.Add(new MethodDef(method, ((OnModelReplacedAttribute)attributes[0]).priority, comp, oldObject));
-                    }
+                    methodDefs.Add(new MethodDef(method, ((OnModelReplacedAttribute)attributes[0]).priority, comp, oldObject));
                 }
             }
             return methodDefs;
@@ -404,7 +424,7 @@ namespace ModelReplaceTool
 
             //Invoke on-replace functions
             StringBuilder invokeLog = new StringBuilder();
-            invokeLog.AppendLine("Invoking " + methodsToInvoke.Count + " on-replace methods...");
+            invokeLog.AppendLine("Invoked " + methodsToInvoke.Count + " on-replace methods");
             object[] oldObjParam = new object[1];
             foreach (var def in methodsToInvoke)
             {
@@ -450,7 +470,7 @@ namespace ModelReplaceTool
         //Copies the components in srcComps to dest. Conflicts (where dest already contains components of the same type)
         //are handled using the conflictResolutions dictionary.
         //Returns a list containing the new/modified components.
-        List<Component> CopyComponents(List<Component> srcComps, GameObject dest, Dictionary<Type, CopyConflictMode> conflictResolutions)
+        List<Component> CopyComponents(List<Component> srcComps, GameObject dest, Dictionary<Type, CopyConflictMode> conflictResolutions, Dictionary<UnityEngine.Object, UnityEngine.Object> remaps)
         {
             List<Component> copiedComponents = new List<Component>();
             Dictionary<Type, Component[]> modifyComps = new Dictionary<Type, Component[]>();
@@ -509,6 +529,7 @@ namespace ModelReplaceTool
                 {
                     UnityEditorInternal.ComponentUtility.PasteComponentValues(target);
                     copiedComponents.Add(target);
+                    remaps[comp] = target;
                 }
             }
             return copiedComponents;
@@ -670,31 +691,50 @@ namespace ModelReplaceTool
             }
         }
 
-        //Finds serialized references in fromRoot (and its descendents and components) to toRoot (and its descendents and components)
-        //Currently just logs everything it finds.
-        void FindCrossReferencesInTree(GameObject fromRoot, GameObject toRoot)
+        //Finds all serialized references from DEST to SRC (and their descendents and components) and
+        //tries to fix any cross-references to point to the correct object in DEST instead. Logs fixed and unfixed references.
+        void ProcessCrossReferencesInTree()
         {
-            UnityEngine.Object[] fromHierarchy = EditorUtility.CollectDeepHierarchy(new UnityEngine.Object[] { fromRoot });
-            UnityEngine.Object[] toHierarchy = EditorUtility.CollectDeepHierarchy(new UnityEngine.Object[] { toRoot });
+            UnityEngine.Object[] fromHierarchy = EditorUtility.CollectDeepHierarchy(new UnityEngine.Object[] { treeRoot.remapTarget });
+            UnityEngine.Object[] toHierarchy = EditorUtility.CollectDeepHierarchy(new UnityEngine.Object[] { srcObj });
             var toHashSet = new HashSet<UnityEngine.Object>(toHierarchy); //dump into hashset for fast finds
-            StringBuilder refLog = new StringBuilder();
+            var compToNodeMap = new Dictionary<Component, ModelTreeNode>();
+            treeRoot.FillComponentToNodeMap(compToNodeMap);
+            StringBuilder fixedRefLog = new StringBuilder();
+            StringBuilder unfixedRefLog = new StringBuilder();
             for (int i = 0; i < fromHierarchy.Length; i++)
             {
                 if (fromHierarchy[i] is Component)
                 {
-                    FindReferences(fromHierarchy[i] as Component, toHashSet, (comp, objRef, prop) => { refLog.AppendLine(comp.gameObject.name + " -> " + comp.GetType() + "." + prop.propertyPath); });
+                    ProcessReferencesInComponent(fromHierarchy[i] as Component, toHashSet, (comp, prop, objRef) => {
+                        if (FixCrossReference(prop, refFixupMap, compToNodeMap))
+                        {
+                            fixedRefLog.AppendLine(comp.gameObject.name + " -> " + comp.GetType() + "." + prop.propertyPath);
+                        }
+                        else
+                        {
+                            unfixedRefLog.AppendLine(comp.gameObject.name + " -> " + comp.GetType() + "." + prop.propertyPath);
+                        }
+                        ;
+                    });
                 }
             }
-            if (refLog.Length > 0)
+            if(fixedRefLog.Length > 0)
             {
-                refLog.Insert(0, "The following references to the source hierarchy were found after copy and could not be automatically fixed:\n");
-                Debug.LogWarning(refLog.ToString());
+                fixedRefLog.Insert(0, "References to the source hierarchy discovered and fixed automatically:\n");
+                Debug.Log(fixedRefLog.ToString());
             }
+            if (unfixedRefLog.Length > 0)
+            {
+                unfixedRefLog.Insert(0, "References to the source hierarchy discovered and could not be fixed automatically:\n");
+                Debug.LogWarning(unfixedRefLog.ToString());
+            }                   
         }
 
         //Finds serializedproperties in the given component to any object in the given set of targets.
         //Performs the given action for each such found serialized property.
-        void FindReferences(Component comp, HashSet<UnityEngine.Object> targets, Action<Component, UnityEngine.Object, SerializedProperty> action)
+        //Note that the serialized property is an iterator and should not be retained as part of the action as it will be invalid later.
+        void ProcessReferencesInComponent(Component comp, HashSet<UnityEngine.Object> targets, ReferenceProcessor action)
         {
             SerializedObject serObj = new SerializedObject(comp);
             SerializedProperty serProp = serObj.GetIterator();
@@ -705,11 +745,56 @@ namespace ModelReplaceTool
                     UnityEngine.Object objRef = serProp.objectReferenceValue;
                     if (objRef != null && targets.Contains(objRef))
                     {
-                        action(comp, objRef, serProp);
+                        action(comp, serProp, objRef);
                     }
                 }
             }
-            while (serProp.Next(true));
+            while (serProp.Next(true));            
+        }
+
+        //Tries to automatically fix a property which holds an objectreference to the old hierarchy
+        //Returns true if a fix was applied, false otherwise
+        bool FixCrossReference(SerializedProperty objProperty, Dictionary<UnityEngine.Object, UnityEngine.Object> remaps, Dictionary<Component, ModelTreeNode> compToNode)
+        {            
+            //References to gameobjects we copied
+            //References to components we copied            
+            //References to gameobjects with remap targets, even if they weren't copied due to not being additions
+            if (remaps.ContainsKey(objProperty.objectReferenceValue))
+            {
+                objProperty.objectReferenceValue = remaps[objProperty.objectReferenceValue];
+                objProperty.serializedObject.ApplyModifiedPropertiesWithoutUndo();                
+                return true;
+            }
+            //References to components that weren't copied, if they are on gameobjects with remap targets
+            //AND the user didn't specify this was a component conflict where DEST should be preserved
+            else if (objProperty.objectReferenceValue is Component)
+            {
+                var comp = objProperty.objectReferenceValue as Component;
+                if(remaps.ContainsKey(comp.gameObject))
+                {
+                    Component[] srcComps = comp.gameObject.GetComponents(comp.GetType());
+                    Component[] destComps = (remaps[comp.gameObject] as GameObject).GetComponents(comp.GetType());
+                    for(int i = 0; i < srcComps.Length && i < destComps.Length; i++)
+                    {
+                        if(srcComps[i] == comp)
+                        {
+                            ModelTreeNode node = null;
+                            compToNode.TryGetValue(comp, out node);
+                            if (node == null 
+                                || node.conflictResolutions == null 
+                                || !node.conflictResolutions.ContainsKey(comp.GetType()) 
+                                || node.conflictResolutions[comp.GetType()] != CopyConflictMode.KeepDest)
+                            {                                    
+                                objProperty.objectReferenceValue = destComps[i];
+                                objProperty.serializedObject.ApplyModifiedPropertiesWithoutUndo();
+                                return true;
+                            }
+                            return false; //conflict mode was "keep dest"
+                        }
+                    }               
+                }
+            }
+            return false;            
         }
     }
 }
